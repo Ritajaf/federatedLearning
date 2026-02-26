@@ -250,27 +250,6 @@ def SNR_to_noise(snr):
     return noise_std
 
 
-def fedprox_proximal_term(model, global_state_dict, mu):
-    """
-    FedProx proximal term: (mu/2) * ||w - w_global||^2 summed over all parameters.
-    global_state_dict: state dict of the global model (e.g. from global_model.state_dict()).
-    """
-    if mu <= 0:
-        return torch.tensor(0.0, device=next(model.parameters()).device)
-    loss_prox = None
-    for name, p in model.named_parameters():
-        if name not in global_state_dict:
-            continue
-        p_global = global_state_dict[name]
-        if p_global.device != p.device:
-            p_global = p_global.to(p.device)
-        term = (p - p_global).pow(2).sum()
-        loss_prox = term if loss_prox is None else loss_prox + term
-    if loss_prox is None:
-        return torch.tensor(0.0, device=next(model.parameters()).device)
-    return (mu / 2.0) * loss_prox
-
-
 def train_step(model, src, trg, n_var, pad, opt, criterion, channel, mi_net=None):
     model.train()
 
@@ -316,50 +295,6 @@ def train_step(model, src, trg, n_var, pad, opt, criterion, channel, mi_net=None
         loss_mine = -mi_lb
         loss = loss + 0.0009 * loss_mine
     # loss = loss_function(pred, trg_real, pad)
-
-    loss.backward()
-    opt.step()
-
-    return loss.item()
-
-
-def train_step_fedprox(model, src, trg, n_var, pad, opt, criterion, channel, global_state_dict, mu):
-    """
-    One training step with FedProx: task loss + (mu/2) * ||w - w_global||^2.
-    Same forward as train_step, then add proximal term and backward.
-    """
-    model.train()
-
-    trg_inp = trg[:, :-1]
-    trg_real = trg[:, 1:]
-
-    channels = Channels()
-    opt.zero_grad()
-
-    src_mask, look_ahead_mask = create_masks(src, trg_inp, pad)
-
-    enc_output = model.encoder(src, src_mask)
-    channel_enc_output = model.channel_encoder(enc_output)
-    Tx_sig = PowerNormalize(channel_enc_output)
-
-    if channel == 'AWGN':
-        Rx_sig = channels.AWGN(Tx_sig, n_var)
-    elif channel == 'Rayleigh':
-        Rx_sig = channels.Rayleigh(Tx_sig, n_var)
-    elif channel == 'Rician':
-        Rx_sig = channels.Rician(Tx_sig, n_var)
-    else:
-        raise ValueError("Please choose from AWGN, Rayleigh, and Rician")
-
-    channel_dec_output = model.channel_decoder(Rx_sig)
-    dec_output = model.decoder(trg_inp, channel_dec_output, look_ahead_mask, src_mask)
-    pred = model.dense(dec_output)
-
-    ntokens = pred.size(-1)
-    loss = loss_function(pred.contiguous().view(-1, ntokens),
-                         trg_real.contiguous().view(-1),
-                         pad, criterion)
-    loss = loss + fedprox_proximal_term(model, global_state_dict, mu)
 
     loss.backward()
     opt.step()
