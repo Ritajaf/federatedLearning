@@ -4,8 +4,13 @@ local vocab and datasets --> partition training data across clients
 --> federated training loop (client selection, local training, aggregation)
 so for each federated round:
 1) select subset of clients
+<<<<<<< HEAD
 2) each selected client trains local DeepSC model starting from global weights with channel noise sampled once per local epoch
 3) server aggregates updated client models using FedAvg (size-weighted) or FedLol (loss-weighted)
+=======
+2) each selected client trains local DeepSC model starting from global weights with channel noise sampled once per local epoch (FedAvg or FedProx if --fedprox_mu > 0)
+3) server aggregates updated client models using FedAvg (same for FedAvg and FedProx)
+>>>>>>> 86414be (using FedProx)
 '''
 
 import os
@@ -20,7 +25,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
 
 from models.transceiver import DeepSC
-from utils import initNetParams, train_step, SNR_to_noise
+from utils import initNetParams, train_step, train_step_fedprox, SNR_to_noise
 from fl_data import EurDatasetLocal, collate_data
 from fl_partition import partition_iid, partition_by_length_mild
 from fl_eval import evaluate_bleu
@@ -72,7 +77,12 @@ def fedlol(global_model, client_states, client_losses, eps=1e-8):
 def client_update(global_model, client_loader, args, pad_idx, criterion):
     """
     Train a local DeepSC model starting from global weights.
+<<<<<<< HEAD
     Returns (state_dict, mean_loss) for use with FedAvg or FedLol aggregation.
+=======
+    If args.fedprox_mu > 0: FedProx local objective (task loss + (mu/2)*||w - w_global||^2).
+    Otherwise: plain FedAvg (task loss only).
+>>>>>>> 86414be (using FedProx)
     """
 
     model = copy.deepcopy(global_model).to(device)
@@ -86,9 +96,17 @@ def client_update(global_model, client_loader, args, pad_idx, criterion):
         weight_decay=5e-4
     )
 
+    use_fedprox = getattr(args, 'fedprox_mu', 0.0) > 0
+    global_state = global_model.state_dict() if use_fedprox else None
+    mu = getattr(args, 'fedprox_mu', 0.0)
+
     num_batches = len(client_loader)
+<<<<<<< HEAD
     use_fedlol = getattr(args, 'algorithm', 'fedlol') == 'fedlol'
     print(f"  [Client] Local training started | batches={num_batches}" + (" (FedLol)" if use_fedlol else ""), flush=True)
+=======
+    print(f"  [Client] Local training started | batches={num_batches}" + (" (FedProx)" if use_fedprox else ""), flush=True)
+>>>>>>> 86414be (using FedProx)
 
     batch_losses = []
 
@@ -105,6 +123,7 @@ def client_update(global_model, client_loader, args, pad_idx, criterion):
         for batch_idx, sents in enumerate(client_loader):
             sents = sents.to(device)
 
+<<<<<<< HEAD
             loss = train_step(
                 model=model,
                 src=sents,
@@ -116,6 +135,32 @@ def client_update(global_model, client_loader, args, pad_idx, criterion):
                 channel=args.channel
             )
             batch_losses.append(loss)
+=======
+            if use_fedprox:
+                loss = train_step_fedprox(
+                    model=model,
+                    src=sents,
+                    trg=sents,
+                    n_var=n_var,
+                    pad=pad_idx,
+                    opt=optimizer,
+                    criterion=criterion,
+                    channel=args.channel,
+                    global_state_dict=global_state,
+                    mu=mu,
+                )
+            else:
+                loss = train_step(
+                    model=model,
+                    src=sents,
+                    trg=sents,
+                    n_var=n_var, # channel noise variance
+                    pad=pad_idx,
+                    opt=optimizer,
+                    criterion=criterion, 
+                    channel=args.channel # channel type (AWGN, Rayleigh, Rician) selected inside train_step
+                )
+>>>>>>> 86414be (using FedProx)
 
             if batch_idx % args.log_interval == 0:
                 print(
@@ -163,8 +208,13 @@ def main():
     parser.add_argument("--local_epochs", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=1e-4)
+<<<<<<< HEAD
     parser.add_argument("--algorithm", type=str, default="fedlol", choices=["fedavg", "fedlol"],
                         help="Aggregation: fedavg (size-weighted) or fedlol (loss-weighted).")
+=======
+    parser.add_argument("--fedprox_mu", type=float, default=0.01,
+                        help="FedProx proximal term weight (mu). 0 = FedAvg, >0 = FedProx.")
+>>>>>>> 86414be (using FedProx)
 
     # Partitioning
     parser.add_argument("--partition", type=str, default="iid", choices=["iid", "length_mild"])
@@ -287,6 +337,7 @@ def main():
             client_sizes.append(len(client_loaders[cid].dataset))
             client_losses.append(mean_loss)
 
+<<<<<<< HEAD
         alg = getattr(args, 'algorithm', 'fedlol')
         if alg == 'fedlol':
             print("[Server] Aggregating client models (FedLol, loss-weighted)")
@@ -294,6 +345,10 @@ def main():
         else:
             print("[Server] Aggregating client models (FedAvg)")
             global_model = fedavg(global_model, client_states, client_sizes)
+=======
+        print("[Server] Aggregating client models (FedProx)" if getattr(args, 'fedprox_mu', 0.0) > 0 else "[Server] Aggregating client models (FedAvg)")
+        global_model = fedavg(global_model, client_states, client_sizes)
+>>>>>>> 86414be (using FedProx)
 
         if r % args.save_every == 0:
             ckpt = os.path.join(
