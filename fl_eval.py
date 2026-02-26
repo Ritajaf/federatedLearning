@@ -119,16 +119,16 @@ def main():
     parser.add_argument(
         "--snr_eval",
         type=float,
-        default=6.0,
+        default="0,3,6,9,12,15,18"
         help="Single SNR (dB) at which to evaluate BLEU (used if --snr_list not set).",
     )
     parser.add_argument(
         "--snr_list",
         type=str,
-        default="",
+        default="0,3,6,9,12,15,18",
         help=(
             "Comma-separated SNR values (dB), e.g. '0,3,6,9,12,15,18'. "
-            "If set, BLEU is evaluated at each SNR and a table is printed."
+            "Default: 0,3,6,9,12,15,18. Set to empty string for single --snr_eval."
         ),
     )
 
