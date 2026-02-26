@@ -120,7 +120,16 @@ def main():
         "--snr_eval",
         type=float,
         default=6.0,
-        help="SNR (dB) at which to evaluate BLEU.",
+        help="Single SNR (dB) at which to evaluate BLEU (used if --snr_list not set).",
+    )
+    parser.add_argument(
+        "--snr_list",
+        type=str,
+        default="",
+        help=(
+            "Comma-separated SNR values (dB), e.g. '0,3,6,9,12,15,18'. "
+            "If set, BLEU is evaluated at each SNR and a table is printed."
+        ),
     )
 
     # Eval settings
@@ -204,24 +213,48 @@ def main():
     model.load_state_dict(state_dict)
 
     # --------------------------------------------------
-    # Run BLEU evaluation
+    # Run BLEU evaluation (single SNR or list)
     # --------------------------------------------------
-    bleu = evaluate_bleu(
-        model=model,
-        data_loader=test_loader,
-        token_to_idx=token_to_idx,
-        pad_idx=pad_idx,
-        start_idx=start_idx,
-        end_idx=end_idx,
-        channel=args.channel,
-        snr_db=args.snr_eval,
-        max_len=args.max_len,
-    )
-
-    print(
-        f"[Eval] BLEU-1 @ SNR={args.snr_eval} dB, channel={args.channel}: {bleu:.4f}",
-        flush=True,
-    )
+    if args.snr_list.strip():
+        snr_values = [float(s.strip()) for s in args.snr_list.split(",") if s.strip()]
+        if not snr_values:
+            raise ValueError("--snr_list must contain at least one value, e.g. '0,3,6,9,12,15,18'")
+        print(f"[Eval] Evaluating BLEU at SNR (dB): {snr_values}", flush=True)
+        results = []
+        for snr_db in snr_values:
+            bleu = evaluate_bleu(
+                model=model,
+                data_loader=test_loader,
+                token_to_idx=token_to_idx,
+                pad_idx=pad_idx,
+                start_idx=start_idx,
+                end_idx=end_idx,
+                channel=args.channel,
+                snr_db=snr_db,
+                max_len=args.max_len,
+            )
+            results.append((snr_db, bleu))
+            print(f"  SNR={snr_db:5.1f} dB  ->  BLEU-1 = {bleu:.4f}", flush=True)
+        print("-" * 40, flush=True)
+        print("Summary (channel={}):".format(args.channel), flush=True)
+        for snr_db, bleu in results:
+            print(f"  {snr_db:5.1f} dB : {bleu:.4f}", flush=True)
+    else:
+        bleu = evaluate_bleu(
+            model=model,
+            data_loader=test_loader,
+            token_to_idx=token_to_idx,
+            pad_idx=pad_idx,
+            start_idx=start_idx,
+            end_idx=end_idx,
+            channel=args.channel,
+            snr_db=args.snr_eval,
+            max_len=args.max_len,
+        )
+        print(
+            f"[Eval] BLEU-1 @ SNR={args.snr_eval} dB, channel={args.channel}: {bleu:.4f}",
+            flush=True,
+        )
 
 
 if __name__ == "__main__":
