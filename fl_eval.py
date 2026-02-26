@@ -42,7 +42,6 @@ def evaluate_bleu(model, data_loader, idx_to_token, pad_idx, start_idx, end_idx,
     return float(np.mean(scores)) if len(scores) > 0 else 0.0
 if __name__ == "__main__":
     import argparse
-    from model import DeepSC  # adjust if needed
     from dataset import get_test_loader  # adjust if needed
 
     parser = argparse.ArgumentParser()
