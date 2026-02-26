@@ -30,21 +30,27 @@ def evaluate_bleu(
     channel: str,
     snr_db: float,
     max_len: int = 30,
+    channel_seed: int = None,
 ):
+    """
+    channel_seed: if set, fix channel randomness per batch so that when evaluating
+    at multiple SNRs, the same channel realization is used for each batch at each SNR.
+    This gives a proper SNR vs BLEU curve (higher SNR => better BLEU).
+    """
     model.eval()
     n_var = SNR_to_noise(snr_db)
 
-    # SeqtoText expects a token->idx dict and internally builds idx->token
     seq_to_text = SeqtoText(token_to_idx, end_idx)
-
-    # BLEU-1 (you can also do BLEU-4 by setting weights)
     bleu = BleuScore(1.0, 0.0, 0.0, 0.0)
 
     scores = []
     pbar = tqdm(data_loader, desc=f"Eval BLEU @ SNR={snr_db}dB", leave=False)
 
-    for sents in pbar:
+    for batch_idx, sents in enumerate(pbar):
         sents = sents.to(next(model.parameters()).device)
+        if channel_seed is not None:
+            torch.manual_seed(channel_seed + batch_idx)
+            np.random.seed(channel_seed + batch_idx)
         pred = greedy_decode(
             model=model,
             src=sents,
@@ -55,7 +61,6 @@ def evaluate_bleu(
             channel=channel,
         )
 
-        # Convert tokens -> text for BLEU computation
         for gt_tokens, pred_tokens in zip(sents, pred):
             gt_sent = seq_to_text.sequence_to_text(gt_tokens.tolist())
             pd_sent = seq_to_text.sequence_to_text(pred_tokens.tolist())
@@ -119,16 +124,16 @@ def main():
     parser.add_argument(
         "--snr_eval",
         type=float,
-        default=6.0,
+        default=6.0, # default SNR for single evaluation
         help="Single SNR (dB) at which to evaluate BLEU (used if --snr_list not set).",
     )
     parser.add_argument(
         "--snr_list",
         type=str,
-        default="0,3,6,9,12,15,18",
+        default="0,6,12,18",
         help=(
-            "Comma-separated SNR values (dB), e.g. '0,3,6,9,12,15,18'. "
-            "Default: 0,3,6,9,12,15,18. Set to empty string for single --snr_eval."
+            "Comma-separated SNR values (dB), e.g. '0,6,12,18'. "
+            "Default: 0,6,12,18. Set to empty string for single --snr_eval."
         ),
     )
 
@@ -220,7 +225,9 @@ def main():
         if not snr_values:
             raise ValueError("--snr_list must contain at least one value, e.g. '0,3,6,9,12,15,18'")
         print(f"[Eval] Evaluating BLEU at SNR (dB): {snr_values}", flush=True)
+        print("[Eval] Using fixed channel seed per batch so SNR vs BLEU reflects noise level (not channel luck).", flush=True)
         results = []
+        channel_seed = 12345
         for snr_db in snr_values:
             bleu = evaluate_bleu(
                 model=model,
@@ -232,6 +239,7 @@ def main():
                 channel=args.channel,
                 snr_db=snr_db,
                 max_len=args.max_len,
+                channel_seed=channel_seed,
             )
             results.append((snr_db, bleu))
             print(f"  SNR={snr_db:5.1f} dB  ->  BLEU-1 = {bleu:.4f}", flush=True)
