@@ -31,14 +31,16 @@ def evaluate_bleu(
     snr_db: float,
     max_len: int = 30,
     channel_seed: int = None,
+    eval_channel_override: str = None,
 ):
     """
     channel_seed: if set, fix channel randomness per batch so that when evaluating
     at multiple SNRs, the same channel realization is used for each batch at each SNR.
-    This gives a proper SNR vs BLEU curve (higher SNR => better BLEU).
+    eval_channel_override: if set (e.g. 'AWGN'), use this channel for eval (cleaner SNR curve).
     """
     model.eval()
     n_var = SNR_to_noise(snr_db)
+    channel_used = (eval_channel_override if eval_channel_override else channel)
 
     seq_to_text = SeqtoText(token_to_idx, end_idx)
     bleu = BleuScore(1.0, 0.0, 0.0, 0.0)
@@ -49,8 +51,10 @@ def evaluate_bleu(
     for batch_idx, sents in enumerate(pbar):
         sents = sents.to(next(model.parameters()).device)
         if channel_seed is not None:
-            torch.manual_seed(channel_seed + batch_idx)
-            np.random.seed(channel_seed + batch_idx)
+            seed = channel_seed + batch_idx
+            rng_seed = seed
+        else:
+            rng_seed = None
         pred = greedy_decode(
             model=model,
             src=sents,
@@ -58,7 +62,8 @@ def evaluate_bleu(
             max_len=max_len,
             padding_idx=pad_idx,
             start_symbol=start_idx,
-            channel=channel,
+            channel=channel_used,
+            rng_seed=rng_seed,
         )
 
         for gt_tokens, pred_tokens in zip(sents, pred):
@@ -120,6 +125,15 @@ def main():
         type=str,
         default="Rayleigh",
         choices=["AWGN", "Rayleigh", "Rician"],
+    )
+    parser.add_argument(
+        "--eval_channel",
+        type=str,
+        default="",
+        help=(
+            "Channel for evaluation only. If set (e.g. AWGN), use this instead of --channel "
+            "so SNR vs BLEU is not masked by random fading. Empty = use --channel."
+        ),
     )
     parser.add_argument(
         "--snr_eval",
@@ -224,7 +238,9 @@ def main():
         snr_values = [float(s.strip()) for s in args.snr_list.split(",") if s.strip()]
         if not snr_values:
             raise ValueError("--snr_list must contain at least one value, e.g. '0,3,6,9,12,15,18'")
-        print(f"[Eval] Evaluating BLEU at SNR (dB): {snr_values}", flush=True)
+        eval_override = (args.eval_channel.strip() or "AWGN")  # default AWGN for multi-SNR so curve reflects noise
+        if eval_override:
+            print(f"[Eval] Using channel '{eval_override}' for evaluation so SNR vs BLEU reflects noise level.", flush=True)
         print("[Eval] Using fixed channel seed per batch so SNR vs BLEU reflects noise level (not channel luck).", flush=True)
         results = []
         channel_seed = 12345
@@ -240,14 +256,17 @@ def main():
                 snr_db=snr_db,
                 max_len=args.max_len,
                 channel_seed=channel_seed,
+                eval_channel_override=eval_override,
             )
             results.append((snr_db, bleu))
             print(f"  SNR={snr_db:5.1f} dB  ->  BLEU-1 = {bleu:.4f}", flush=True)
         print("-" * 40, flush=True)
-        print("Summary (channel={}):".format(args.channel), flush=True)
+        channel_label = eval_override or args.channel
+        print("Summary (channel={}):".format(channel_label), flush=True)
         for snr_db, bleu in results:
             print(f"  {snr_db:5.1f} dB : {bleu:.4f}", flush=True)
     else:
+        eval_override = args.eval_channel.strip() or None
         bleu = evaluate_bleu(
             model=model,
             data_loader=test_loader,
@@ -258,9 +277,11 @@ def main():
             channel=args.channel,
             snr_db=args.snr_eval,
             max_len=args.max_len,
+            eval_channel_override=eval_override,
         )
+        ch_label = eval_override or args.channel
         print(
-            f"[Eval] BLEU-1 @ SNR={args.snr_eval} dB, channel={args.channel}: {bleu:.4f}",
+            f"[Eval] BLEU-1 @ SNR={args.snr_eval} dB, channel={ch_label}: {bleu:.4f}",
             flush=True,
         )
 

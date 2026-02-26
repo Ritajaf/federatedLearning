@@ -362,7 +362,15 @@ def val_step(model, src, trg, n_var, pad, criterion, channel):
     
     return loss.item()
     
-def greedy_decode(model, src, n_var, max_len, padding_idx, start_symbol, channel):
+def greedy_decode(model, src, n_var, max_len, padding_idx, start_symbol, channel, rng_seed=None):
+    """
+    rng_seed: if set, seed RNG right before channel so same batch gets same channel across SNRs.
+    """
+    if rng_seed is not None:
+        torch.manual_seed(rng_seed)
+        np.random.seed(rng_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(rng_seed)
 
     # create src_mask
     channels = Channels()
