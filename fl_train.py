@@ -152,8 +152,10 @@ def main():
 
     # Channel modeling
     parser.add_argument("--channel", type=str, default="Rayleigh", choices=["AWGN", "Rayleigh", "Rician"])
-    parser.add_argument("--snr_train_low", type=float, default=5.0)
-    parser.add_argument("--snr_train_high", type=float, default=10.0)
+    parser.add_argument("--snr_train_low", type=float, default=0.0,
+                        help="Low end of training SNR range (dB). Wide range (e.g. 0-20) so BLEU increases with SNR at eval.")
+    parser.add_argument("--snr_train_high", type=float, default=20.0,
+                        help="High end of training SNR range (dB).")
     parser.add_argument("--snr_eval", type=float, default=6.0)
 
     # Federated Learning settings

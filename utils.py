@@ -168,21 +168,31 @@ class SeqtoText:
 
 class Channels():
 
-    def AWGN(self, Tx_sig, n_var):
-        "Additive White Gaussian Noise Channel - simplest channel model - it adds guassian noise with std n_var to the transmitted signal"
-        Rx_sig = Tx_sig + torch.normal(0, n_var, size=Tx_sig.shape).to(device)
-        return Rx_sig
+    def AWGN(self, Tx_sig, n_var, generator=None):
+        """Additive White Gaussian Noise: Rx = Tx + N(0, n_var^2). generator ensures deterministic scaling by n_var."""
+        if generator is not None:
+            noise = torch.normal(0, n_var, size=Tx_sig.shape, device=Tx_sig.device, generator=generator)
+        else:
+            noise = torch.normal(0, n_var, size=Tx_sig.shape).to(Tx_sig.device)
+        return Tx_sig + noise
 
-    def Rayleigh(self, Tx_sig, n_var):
+    def Rayleigh(self, Tx_sig, n_var, generator=None):
         shape = Tx_sig.shape
-        H_real = torch.normal(0, math.sqrt(1/2), size=[1]).to(device)
-        H_imag = torch.normal(0, math.sqrt(1/2), size=[1]).to(device)
-        H = torch.Tensor([[H_real, -H_imag], [H_imag, H_real]]).to(device)
+        dev = Tx_sig.device
+        if generator is not None:
+            H_real = torch.normal(0, math.sqrt(1/2), size=[1], device=dev, generator=generator)
+            H_imag = torch.normal(0, math.sqrt(1/2), size=[1], device=dev, generator=generator)
+        else:
+            H_real = torch.normal(0, math.sqrt(1/2), size=[1]).to(dev)
+            H_imag = torch.normal(0, math.sqrt(1/2), size=[1]).to(dev)
+        # H is 2x2: [[H_real, -H_imag], [H_imag, H_real]]
+        H = torch.stack([
+            torch.cat([H_real, -H_imag]),
+            torch.cat([H_imag, H_real])
+        ])
         Tx_sig = torch.matmul(Tx_sig.view(shape[0], -1, 2), H)
-        Rx_sig = self.AWGN(Tx_sig, n_var)
-        # Channel estimation
+        Rx_sig = self.AWGN(Tx_sig, n_var, generator=generator)
         Rx_sig = torch.matmul(Rx_sig, torch.inverse(H)).view(shape)
-
         return Rx_sig
 
     def Rician(self, Tx_sig, n_var, K=1):
@@ -364,26 +374,25 @@ def val_step(model, src, trg, n_var, pad, criterion, channel):
     
 def greedy_decode(model, src, n_var, max_len, padding_idx, start_symbol, channel, rng_seed=None):
     """
-    rng_seed: if set, seed RNG right before channel so same batch gets same channel across SNRs.
+    rng_seed: if set, use a dedicated Generator so the same base randomness is used across SNRs
+    and only n_var (noise level) changes → BLEU increases with SNR.
     """
-    if rng_seed is not None:
-        torch.manual_seed(rng_seed)
-        np.random.seed(rng_seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(rng_seed)
-
-    # create src_mask
     channels = Channels()
-    src_mask = (src == padding_idx).unsqueeze(-2).type(torch.FloatTensor).to(device) #[batch, 1, seq_len]
+    if rng_seed is not None:
+        gen = torch.Generator(device=src.device).manual_seed(int(rng_seed))
+    else:
+        gen = None
+
+    src_mask = (src == padding_idx).unsqueeze(-2).type(torch.FloatTensor).to(src.device)
 
     enc_output = model.encoder(src, src_mask)
     channel_enc_output = model.channel_encoder(enc_output)
     Tx_sig = PowerNormalize(channel_enc_output)
 
     if channel == 'AWGN':
-        Rx_sig = channels.AWGN(Tx_sig, n_var)
+        Rx_sig = channels.AWGN(Tx_sig, n_var, generator=gen)
     elif channel == 'Rayleigh':
-        Rx_sig = channels.Rayleigh(Tx_sig, n_var)
+        Rx_sig = channels.Rayleigh(Tx_sig, n_var, generator=gen)
     elif channel == 'Rician':
         Rx_sig = channels.Rician(Tx_sig, n_var)
     else:
@@ -401,7 +410,7 @@ def greedy_decode(model, src, n_var, max_len, padding_idx, start_symbol, channel
         look_ahead_mask = subsequent_mask(outputs.size(1)).type(torch.FloatTensor)
 #        print(look_ahead_mask)
         combined_mask = torch.max(trg_mask, look_ahead_mask)
-        combined_mask = combined_mask.to(device)
+        combined_mask = combined_mask.to(src.device)
 
         # decode the received signal
         dec_output = model.decoder(outputs, memory, combined_mask, None)
