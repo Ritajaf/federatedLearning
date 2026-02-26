@@ -1,24 +1,23 @@
-# fl_train.py
 '''
-local vocab and datasets --> partition training dara across clients 
+local vocab and datasets --> partition training data across clients
 --> initialize global DeepSC model
 --> federated training loop (client selection, local training, aggregation)
-so for each federated round: 
+so for each federated round:
 1) select subset of clients
 2) each selected client trains local DeepSC model starting from global weights with channel noise sampled once per local epoch
-3) server aggregates updated client models using FedAvg
+3) server aggregates updated client models using FedAvg (size-weighted) or FedLol (loss-weighted)
 '''
 
 import os
 import json
-import copy # to copy model/state dicts
-import argparse # for parsing command-line arguments (rounds, clients, model size, learning rate, etc)
+import copy
+import argparse
 import random
 import numpy as np
 import torch
-import torch.nn as nn # loss function (CrossEntropyLoss)
+import torch.nn as nn
 
-from torch.utils.data import DataLoader, Subset # to create data loaders for each client
+from torch.utils.data import DataLoader, Subset
 
 from models.transceiver import DeepSC
 from utils import initNetParams, train_step, SNR_to_noise
@@ -40,11 +39,10 @@ def set_seed(seed: int):
 
 def fedavg(global_model, client_states, client_sizes):
     """
-    FedAvg: weighted average = sum of client models weighted by their dataset sizes
+    FedAvg: weighted average = sum of client models weighted by their dataset sizes.
     """
-    new_state = copy.deepcopy(global_model.state_dict()) # start from a copy of global model. using deepcopy to avoid modifying original model {accidentally}
-    total = float(sum(client_sizes)) # total number of samples across all selected clients
-    # for each parameter in the model, compute weighted average
+    new_state = copy.deepcopy(global_model.state_dict())
+    total = float(sum(client_sizes))
     for k in new_state.keys():
         new_state[k] = sum(
             client_states[i][k] * (client_sizes[i] / total)
@@ -54,18 +52,32 @@ def fedavg(global_model, client_states, client_sizes):
     return global_model
 
 
+def fedlol(global_model, client_states, client_losses, eps=1e-8):
+    """
+    FedLol: aggregate client models weighted by inverse loss (lower loss -> higher weight).
+    weight_k = (1 / (loss_k + eps)) / sum_j(1 / (loss_j + eps))
+    """
+    inv_losses = np.array([1.0 / (L + eps) for L in client_losses], dtype=np.float64)
+    weights = inv_losses / inv_losses.sum()
+    new_state = copy.deepcopy(global_model.state_dict())
+    for k in new_state.keys():
+        new_state[k] = sum(
+            client_states[i][k] * weights[i]
+            for i in range(len(client_states))
+        )
+    global_model.load_state_dict(new_state)
+    return global_model
+
+
 def client_update(global_model, client_loader, args, pad_idx, criterion):
     """
     Train a local DeepSC model starting from global weights.
-    FULL version with proper logging.
+    Returns (state_dict, mean_loss) for use with FedAvg or FedLol aggregation.
     """
 
-    # 1) Initialize local model from global
-    model = copy.deepcopy(global_model).to(device) #each client starts with the same global model at the beginning of the round
-    # which is a separate copy from the global model to avoid modifying it during local training
-    model.train() # enable training mode (dropout, batchnorm, etc)
+    model = copy.deepcopy(global_model).to(device)
+    model.train()
 
-    # 2) Local optimizer (same as centralized DeepSC)
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=args.lr,
@@ -75,47 +87,46 @@ def client_update(global_model, client_loader, args, pad_idx, criterion):
     )
 
     num_batches = len(client_loader)
-    print(f"  [Client] Local training started | batches={num_batches}", flush=True)
+    use_fedlol = getattr(args, 'algorithm', 'fedlol') == 'fedlol'
+    print(f"  [Client] Local training started | batches={num_batches}" + (" (FedLol)" if use_fedlol else ""), flush=True)
 
-    # 3) Local epochs
-    for local_ep in range(args.local_epochs): #each selected client performs multiple local epochs {E}
+    batch_losses = []
 
-        # Sample channel noise once per local epoch
-        # channel noise is sampled uniformly within [snr_train_low, snr_train_high] inside training. The nosise varies across local epochs
+    for local_ep in range(args.local_epochs):
+
         n_var = np.random.uniform(
             SNR_to_noise(args.snr_train_low),
             SNR_to_noise(args.snr_train_high),
             size=(1,)
         )[0]
 
-        #logs the sampled noise variance for this local epoch
         print(f"    Local epoch {local_ep+1}/{args.local_epochs} | n_var={n_var:.4e}", flush=True)
-        
-        # 4) Iterate over batches
+
         for batch_idx, sents in enumerate(client_loader):
-            sents = sents.to(device) # shape (batch_size, seq_len) = padded tensors of token ids
+            sents = sents.to(device)
 
             loss = train_step(
                 model=model,
                 src=sents,
                 trg=sents,
-                n_var=n_var, # channel noise variance
+                n_var=n_var,
                 pad=pad_idx,
                 opt=optimizer,
-                criterion=criterion, 
-                channel=args.channel # channel type (AWGN, Rayleigh, Rician) selected inside train_step
+                criterion=criterion,
+                channel=args.channel
             )
+            batch_losses.append(loss)
 
-            # Lightweight logging every N batches
             if batch_idx % args.log_interval == 0:
                 print(
                     f"      batch {batch_idx+1}/{num_batches} | loss={loss:.4f}",
                     flush=True
                 )
 
+    mean_loss = float(np.mean(batch_losses)) if batch_losses else 0.0
     print("  [Client] Local training finished", flush=True)
 
-    return model.state_dict() # return the updated local model's state dict to server for aggregation
+    return model.state_dict(), mean_loss
 
 
 def main():
@@ -152,6 +163,8 @@ def main():
     parser.add_argument("--local_epochs", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--algorithm", type=str, default="fedlol", choices=["fedavg", "fedlol"],
+                        help="Aggregation: fedavg (size-weighted) or fedlol (loss-weighted).")
 
     # Partitioning
     parser.add_argument("--partition", type=str, default="iid", choices=["iid", "length_mild"])
@@ -257,11 +270,12 @@ def main():
 
         client_states = []
         client_sizes = []
+        client_losses = []
 
         for cid in selected:
             print(f"[Server] -> Training client {cid}")
 
-            st = client_update(
+            st, mean_loss = client_update(
                 global_model=global_model,
                 client_loader=client_loaders[cid],
                 args=args,
@@ -271,9 +285,15 @@ def main():
 
             client_states.append(st)
             client_sizes.append(len(client_loaders[cid].dataset))
+            client_losses.append(mean_loss)
 
-        print("[Server] Aggregating client models (FedAvg)")
-        global_model = fedavg(global_model, client_states, client_sizes)
+        alg = getattr(args, 'algorithm', 'fedlol')
+        if alg == 'fedlol':
+            print("[Server] Aggregating client models (FedLol, loss-weighted)")
+            global_model = fedlol(global_model, client_states, client_losses)
+        else:
+            print("[Server] Aggregating client models (FedAvg)")
+            global_model = fedavg(global_model, client_states, client_sizes)
 
         if r % args.save_every == 0:
             ckpt = os.path.join(
