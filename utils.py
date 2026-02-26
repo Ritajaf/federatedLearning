@@ -249,6 +249,7 @@ def SNR_to_noise(snr):
 
     return noise_std
 
+
 def train_step(model, src, trg, n_var, pad, opt, criterion, channel, mi_net=None):
     model.train()
 
