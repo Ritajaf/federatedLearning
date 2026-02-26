@@ -119,7 +119,7 @@ def main():
     parser.add_argument(
         "--snr_eval",
         type=float,
-        default="0,3,6,9,12,15,18"
+        default="0,3,6,9,12,15,18",
         help="Single SNR (dB) at which to evaluate BLEU (used if --snr_list not set).",
     )
     parser.add_argument(
