@@ -32,14 +32,16 @@ def evaluate_bleu(
     max_len: int = 30,
     channel_seed: int = None,
     eval_channel_override: str = None,
+    noise_scale: float = 1.0,
 ):
     """
     channel_seed: if set, fix channel randomness per batch so that when evaluating
     at multiple SNRs, the same channel realization is used for each batch at each SNR.
     eval_channel_override: if set (e.g. 'AWGN'), use this channel for eval (cleaner SNR curve).
+    noise_scale: multiply channel noise std by this (e.g. 3.0) so BLEU vs SNR curve is more pronounced.
     """
     model.eval()
-    n_var = SNR_to_noise(snr_db)
+    n_var = float(SNR_to_noise(snr_db)) * noise_scale
     channel_used = (eval_channel_override if eval_channel_override else channel)
 
     seq_to_text = SeqtoText(token_to_idx, end_idx)
@@ -134,6 +136,12 @@ def main():
             "Channel for evaluation only. If set (e.g. AWGN), use this instead of --channel "
             "so SNR vs BLEU is not masked by random fading. Empty = use --channel."
         ),
+    )
+    parser.add_argument(
+        "--eval_noise_scale",
+        type=float,
+        default=3.0,
+        help="Scale channel noise at eval (n_var *= scale). Use >1 to make BLEU vs SNR curve clearer (default 3.0).",
     )
     parser.add_argument(
         "--snr_eval",
@@ -241,6 +249,8 @@ def main():
         eval_override = (args.eval_channel.strip() or "AWGN")  # default AWGN for multi-SNR so curve reflects noise
         if eval_override:
             print(f"[Eval] Using channel '{eval_override}' for evaluation so SNR vs BLEU reflects noise level.", flush=True)
+        noise_scale = getattr(args, 'eval_noise_scale', 3.0)
+        print(f"[Eval] Noise scale = {noise_scale} (n_var *= {noise_scale}).", flush=True)
         print("[Eval] Using fixed channel seed per batch so SNR vs BLEU reflects noise level (not channel luck).", flush=True)
         results = []
         channel_seed = 12345
@@ -257,6 +267,7 @@ def main():
                 max_len=args.max_len,
                 channel_seed=channel_seed,
                 eval_channel_override=eval_override,
+                noise_scale=noise_scale,
             )
             results.append((snr_db, bleu))
             print(f"  SNR={snr_db:5.1f} dB  ->  BLEU-1 = {bleu:.4f}", flush=True)
@@ -267,6 +278,7 @@ def main():
             print(f"  {snr_db:5.1f} dB : {bleu:.4f}", flush=True)
     else:
         eval_override = args.eval_channel.strip() or None
+        noise_scale = getattr(args, 'eval_noise_scale', 1.0)
         bleu = evaluate_bleu(
             model=model,
             data_loader=test_loader,
@@ -278,6 +290,7 @@ def main():
             snr_db=args.snr_eval,
             max_len=args.max_len,
             eval_channel_override=eval_override,
+            noise_scale=noise_scale,
         )
         ch_label = eval_override or args.channel
         print(
