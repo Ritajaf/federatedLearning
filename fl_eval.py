@@ -39,3 +39,36 @@ def evaluate_bleu(model, data_loader, idx_to_token, pad_idx, start_idx, end_idx,
             scores.append(bleu.compute_blue_score([gt_sent], [pd_sent])[0])
 
     return float(np.mean(scores)) if len(scores) > 0 else 0.0
+if __name__ == "__main__":
+    import argparse
+    from model import DeepSC  # adjust if needed
+    from dataset import get_test_loader  # adjust if needed
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data_root", type=str, required=True)
+    parser.add_argument("--ckpt_path", type=str, required=True)
+    parser.add_argument("--snr_db", type=float, default=10)
+    parser.add_argument("--channel", type=str, default="Rayleigh")
+    args = parser.parse_args()
+
+    # Load model
+    model = DeepSC(...)
+    model.load_state_dict(torch.load(args.ckpt_path, map_location="cpu"))
+    model.cuda()
+
+    # Load data
+    test_loader, idx_to_token, pad_idx, start_idx, end_idx = get_test_loader(args.data_root)
+
+    # Evaluate
+    bleu = evaluate_bleu(
+        model=model,
+        data_loader=test_loader,
+        idx_to_token=idx_to_token,
+        pad_idx=pad_idx,
+        start_idx=start_idx,
+        end_idx=end_idx,
+        channel=args.channel,
+        snr_db=args.snr_db
+    )
+
+    print(f"\nBLEU score @ SNR={args.snr_db} dB ({args.channel}): {bleu:.4f}")
