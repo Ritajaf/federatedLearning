@@ -3,7 +3,8 @@ import torch
 import numpy as np
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-
+from models.transceiver import DeepSC
+from models.mutual_info import Mine
 from utils import SNR_to_noise, greedy_decode, SeqtoText, BleuScore
 
 @torch.no_grad()
