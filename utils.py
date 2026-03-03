@@ -19,6 +19,7 @@ from w3lib.html import remove_tags
 from nltk.translate.bleu_score import sentence_bleu
 
 from models.mutual_info import sample_batch, mutual_information
+from gan_modules import get_nearest_prototype
 
 #all tensors created in this file will be moved to this device
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu") 
@@ -260,7 +261,19 @@ def SNR_to_noise(snr):
     return noise_std
 
 
-def train_step(model, src, trg, n_var, pad, opt, criterion, channel, mi_net=None):
+def train_step(
+    model,
+    src,
+    trg,
+    n_var,
+    pad,
+    opt,
+    criterion,
+    channel,
+    mi_net=None,
+    generator=None,
+    global_prototypes=None,
+):
     model.train()
 
     trg_inp = trg[:, :-1]
@@ -272,6 +285,27 @@ def train_step(model, src, trg, n_var, pad, opt, criterion, channel, mi_net=None
     src_mask, look_ahead_mask = create_masks(src, trg_inp, pad)
     
     enc_output = model.encoder(src, src_mask)
+
+    # Optional: route encoder output through a global semantic generator conditioned
+    # on channel state and prototype bank before channel encoding.
+    if generator is not None:
+        # derive SNR in dB from noise variance (per complex dimension):
+        # n_var = 1 / sqrt(2 * snr_linear)  =>  snr_linear = 1 / (2 * n_var^2)
+        snr_linear = 1.0 / (2.0 * (n_var ** 2))
+        snr_db = 10.0 * math.log10(snr_linear + 1e-8)
+
+        # sentence-level semantic embedding
+        sent_emb = enc_output.mean(dim=1)  # [B, d_model]
+        B, _ = sent_emb.shape
+        channel_state = torch.full((B, 1), snr_db, device=enc_output.device)
+        proto_vec = get_nearest_prototype(sent_emb, global_prototypes) if global_prototypes is not None else torch.zeros_like(sent_emb)
+        robust_emb = generator(sent_emb, channel_state, proto_vec)  # [B, d_model]
+
+        # broadcast robust embedding back to all time steps as a residual
+        enc_output = enc_output + robust_emb.unsqueeze(1)
+        # Temporary debug: confirm robust_emb is non-zero
+        print(f"[DEBUG] robust_emb norm: {robust_emb.norm().item():.4f}")
+
     channel_enc_output = model.channel_encoder(enc_output)
     Tx_sig = PowerNormalize(channel_enc_output)
 
@@ -340,7 +374,17 @@ def train_mi(model, mi_net, src, n_var, padding_idx, opt, channel):
 
     return loss_mine.item()
 
-def val_step(model, src, trg, n_var, pad, criterion, channel):
+def val_step(
+    model,
+    src,
+    trg,
+    n_var,
+    pad,
+    criterion,
+    channel,
+    generator=None,
+    global_prototypes=None,
+):
     channels = Channels()
     trg_inp = trg[:, :-1]
     trg_real = trg[:, 1:]
@@ -348,6 +392,18 @@ def val_step(model, src, trg, n_var, pad, criterion, channel):
     src_mask, look_ahead_mask = create_masks(src, trg_inp, pad)
 
     enc_output = model.encoder(src, src_mask)
+
+    if generator is not None:
+        snr_linear = 1.0 / (2.0 * (n_var ** 2))
+        snr_db = 10.0 * math.log10(snr_linear + 1e-8)
+
+        sent_emb = enc_output.mean(dim=1)  # [B, d_model]
+        B, _ = sent_emb.shape
+        channel_state = torch.full((B, 1), snr_db, device=enc_output.device)
+        proto_vec = get_nearest_prototype(sent_emb, global_prototypes) if global_prototypes is not None else torch.zeros_like(sent_emb)
+        robust_emb = generator(sent_emb, channel_state, proto_vec)
+        enc_output = enc_output + robust_emb.unsqueeze(1)
+
     channel_enc_output = model.channel_encoder(enc_output)
     Tx_sig = PowerNormalize(channel_enc_output)
     if channel == 'AWGN':
@@ -372,7 +428,18 @@ def val_step(model, src, trg, n_var, pad, criterion, channel):
     
     return loss.item()
     
-def greedy_decode(model, src, n_var, max_len, padding_idx, start_symbol, channel, rng_seed=None):
+def greedy_decode(
+    model,
+    src,
+    n_var,
+    max_len,
+    padding_idx,
+    start_symbol,
+    channel,
+    rng_seed=None,
+    generator=None,
+    global_prototypes=None,
+):
     """
     rng_seed: if set, use a dedicated Generator so the same base randomness is used across SNRs
     and only n_var (noise level) changes → BLEU increases with SNR.
@@ -386,6 +453,18 @@ def greedy_decode(model, src, n_var, max_len, padding_idx, start_symbol, channel
     src_mask = (src == padding_idx).unsqueeze(-2).type(torch.FloatTensor).to(src.device)
 
     enc_output = model.encoder(src, src_mask)
+
+    if generator is not None:
+        snr_linear = 1.0 / (2.0 * (n_var ** 2))
+        snr_db = 10.0 * math.log10(snr_linear + 1e-8)
+
+        sent_emb = enc_output.mean(dim=1)  # [B, d_model]
+        B, _ = sent_emb.shape
+        channel_state = torch.full((B, 1), snr_db, device=enc_output.device)
+        proto_vec = get_nearest_prototype(sent_emb, global_prototypes) if global_prototypes is not None else torch.zeros_like(sent_emb)
+        robust_emb = generator(sent_emb, channel_state, proto_vec)
+        enc_output = enc_output + robust_emb.unsqueeze(1)
+
     channel_enc_output = model.channel_encoder(enc_output)
     Tx_sig = PowerNormalize(channel_enc_output)
 

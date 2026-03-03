@@ -22,8 +22,14 @@ from torch.utils.data import DataLoader, Subset
 from models.transceiver import DeepSC
 from utils import initNetParams, train_step, SNR_to_noise
 from fl_data import EurDatasetLocal, collate_data
-from fl_partition import partition_iid, partition_by_length_mild
+from fl_partition import partition_iid, partition_by_length_mild, partition_dirichlet_length
 from fl_eval import evaluate_bleu
+from gan_modules import (
+    SemanticGenerator,
+    SemanticDiscriminator,
+    local_train_gan,
+    federated_aggregate_generator,
+)
 
 # use GPU if available, else CPU
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -113,7 +119,7 @@ def client_update(global_model, client_loader, args, pad_idx, criterion):
                 pad=pad_idx,
                 opt=optimizer,
                 criterion=criterion,
-                channel=args.channel
+                channel=args.channel,
             )
             batch_losses.append(loss)
 
@@ -127,6 +133,115 @@ def client_update(global_model, client_loader, args, pad_idx, criterion):
     print("  [Client] Local training finished", flush=True)
 
     return model.state_dict(), mean_loss
+
+
+def client_update_with_gan(
+    global_model,
+    global_generator,
+    global_prototypes,
+    client_loader,
+    args,
+    pad_idx,
+    criterion,
+):
+    """
+    Client update that:
+      1) runs standard local DeepSC training (same as client_update)
+      2) runs an additional two-timescale GAN training in semantic space
+         using the DeepSC encoder as feature extractor.
+
+    Returns:
+        - updated DeepSC state_dict
+        - mean token-level loss
+        - updated generator state_dict (for GAN aggregation)
+        - client_snr used for GAN conditioning
+        - local prototype bank tensor
+    """
+
+    model = copy.deepcopy(global_model).to(device)
+    model.train()
+
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=args.lr,
+        betas=(0.9, 0.98),
+        eps=1e-8,
+        weight_decay=5e-4,
+    )
+
+    num_batches = len(client_loader)
+    use_fedlol = getattr(args, "algorithm", "fedlol") == "fedlol"
+    print(
+        f"  [Client] Local training with GAN started | batches={num_batches}"
+        + (" (FedLol)" if use_fedlol else ""),
+        flush=True,
+    )
+
+    batch_losses = []
+
+    for local_ep in range(args.local_epochs):
+        n_var = np.random.uniform(
+            SNR_to_noise(args.snr_train_low),
+            SNR_to_noise(args.snr_train_high),
+            size=(1,),
+        )[0]
+
+        print(
+            f"    Local epoch {local_ep+1}/{args.local_epochs} | n_var={n_var:.4e}",
+            flush=True,
+        )
+
+        for batch_idx, sents in enumerate(client_loader):
+            sents = sents.to(device)
+
+            loss = train_step(
+                model=model,
+                src=sents,
+                trg=sents,
+                n_var=n_var,
+                pad=pad_idx,
+                opt=optimizer,
+                criterion=criterion,
+                channel=args.channel,
+                generator=global_generator,
+                global_prototypes=global_prototypes,
+            )
+            batch_losses.append(loss)
+
+            if batch_idx % args.log_interval == 0:
+                print(
+                    f"      batch {batch_idx+1}/{num_batches} | loss={loss:.4f}",
+                    flush=True,
+                )
+
+    mean_loss = float(np.mean(batch_losses)) if batch_losses else 0.0
+    print("  [Client] Local DeepSC training finished", flush=True)
+
+    # ------------------------------
+    # GAN training in semantic space
+    # ------------------------------
+    local_generator = copy.deepcopy(global_generator).to(device)
+    local_discriminator = SemanticDiscriminator(embedding_dim=args.d_model).to(device)
+
+    # use a representative SNR for conditioning (e.g. mid-point of training range)
+    gan_snr = float((args.snr_train_low + args.snr_train_high) / 2.0)
+
+    gen_state, client_snr, local_prototypes = local_train_gan(
+        client_model=model,
+        generator=local_generator,
+        discriminator=local_discriminator,
+        dataloader=client_loader,
+        global_prototypes=global_prototypes,
+        pad_idx=pad_idx,
+        snr=gan_snr,
+        n_disc_steps=args.gan_disc_steps,
+        gen_lr=args.gan_gen_lr,
+        disc_lr=args.gan_disc_lr,
+    )
+
+    print("  [Client] Local GAN training finished", flush=True)
+
+    return model.state_dict(), mean_loss, gen_state, client_snr, local_prototypes
 
 
 def main():
@@ -169,12 +284,52 @@ def main():
                         help="Aggregation: fedavg (size-weighted) or fedlol (loss-weighted).")
 
     # Partitioning
-    parser.add_argument("--partition", type=str, default="iid", choices=["iid", "length_mild"])
+    parser.add_argument(
+        "--partition",
+        type=str,
+        default="iid",
+        choices=["iid", "length_mild", "dirichlet"],
+    )
+    parser.add_argument(
+        "--dirichlet_alpha",
+        type=float,
+        default=0.5,
+        help=(
+            "Dirichlet alpha for 'dirichlet' partition: "
+            "lower=more non-IID (0.1=extreme, 0.5=moderate, 5.0=near-IID)"
+        ),
+    )
     parser.add_argument("--seed", type=int, default=0)
 
     # Saving
     parser.add_argument("--save_dir", type=str, default="checkpoints_fed")
     parser.add_argument("--save_every", type=int, default=10)
+
+    # GAN options
+    parser.add_argument(
+        "--enable_gan",
+        action="store_true",
+        help="If set, train a conditional GAN on top of the encoder and "
+        "federate only the generator using similarity-weighted aggregation.",
+    )
+    parser.add_argument(
+        "--gan_disc_steps",
+        type=int,
+        default=5,
+        help="Number of discriminator steps per generator step in local GAN training.",
+    )
+    parser.add_argument(
+        "--gan_gen_lr",
+        type=float,
+        default=1e-4,
+        help="Generator learning rate for local GAN training.",
+    )
+    parser.add_argument(
+        "--gan_disc_lr",
+        type=float,
+        default=1e-4,
+        help="Discriminator learning rate for local GAN training.",
+    )
 
     args = parser.parse_args()
     set_seed(args.seed)
@@ -216,9 +371,16 @@ def main():
         client_indices = partition_iid(
             len(train_set), args.num_clients, seed=args.seed
         )
-    else:
+    elif args.partition == "length_mild":
         client_indices = partition_by_length_mild(
             train_set, args.num_clients, seed=args.seed
+        )
+    else:  # dirichlet
+        client_indices = partition_dirichlet_length(
+            train_set,
+            args.num_clients,
+            alpha=args.dirichlet_alpha,
+            seed=args.seed,
         )
 
     # Create DataLoaders for each client
@@ -252,6 +414,20 @@ def main():
     initNetParams(global_model)
     criterion = nn.CrossEntropyLoss(reduction="none")
 
+    # Optional global GAN generator (discriminator stays local on clients)
+    if args.enable_gan:
+        global_generator = SemanticGenerator(
+            semantic_dim=args.d_model,
+            channel_dim=1,
+            prototype_dim=args.d_model,
+            output_dim=args.d_model,
+        ).to(device)
+        global_prototypes = None
+        print("[Setup] Conditional GAN enabled (generator will be federated, discriminator stays local).", flush=True)
+    else:
+        global_generator = None
+        global_prototypes = None
+
     os.makedirs(args.save_dir, exist_ok=True)
 
     # ==================================================
@@ -274,16 +450,36 @@ def main():
         client_sizes = []
         client_losses = []
 
+        # for GAN-enabled mode, also collect generator states and prototype banks
+        client_gen_states = []
+        client_snrs = []
+        client_proto_banks = []
+
         for cid in selected:
             print(f"[Server] -> Training client {cid}")
 
-            st, mean_loss = client_update(
-                global_model=global_model,
-                client_loader=client_loaders[cid],
-                args=args,
-                pad_idx=pad_idx,
-                criterion=criterion
-            )
+            if args.enable_gan:
+                st, mean_loss, gen_st, client_snr, local_protos = client_update_with_gan(
+                    global_model=global_model,
+                    global_generator=global_generator,
+                    global_prototypes=global_prototypes,
+                    client_loader=client_loaders[cid],
+                    args=args,
+                    pad_idx=pad_idx,
+                    criterion=criterion,
+                )
+
+                client_gen_states.append(gen_st)
+                client_snrs.append(client_snr)
+                client_proto_banks.append(local_protos)
+            else:
+                st, mean_loss = client_update(
+                    global_model=global_model,
+                    client_loader=client_loaders[cid],
+                    args=args,
+                    pad_idx=pad_idx,
+                    criterion=criterion
+                )
 
             client_states.append(st)
             client_sizes.append(len(client_loaders[cid].dataset))
@@ -291,11 +487,27 @@ def main():
 
         alg = getattr(args, 'algorithm', 'fedlol')
         if alg == 'fedlol':
-            print("[Server] Aggregating client models (FedLol, loss-weighted)")
+            print("[Server] Aggregating client DeepSC models (FedLol, loss-weighted)")
             global_model = fedlol(global_model, client_states, client_losses)
         else:
-            print("[Server] Aggregating client models (FedAvg)")
+            print("[Server] Aggregating client DeepSC models (FedAvg)")
             global_model = fedavg(global_model, client_states, client_sizes)
+
+        # Aggregate generator only (discriminator is never aggregated)
+        if args.enable_gan and client_gen_states:
+            print("[Server] Aggregating client GAN generators (similarity-weighted)", flush=True)
+            agg_gen_state = federated_aggregate_generator(
+                client_generator_weights=client_gen_states,
+                client_snrs=client_snrs,
+                client_prototypes=client_proto_banks,
+            )
+            global_generator.load_state_dict(agg_gen_state)
+
+            # Update global prototype bank as a simple concatenation of client prototypes
+            all_protos = [p for p in client_proto_banks if p is not None and p.numel() > 0]
+            if all_protos:
+                global_prototypes = torch.cat(all_protos, dim=0).detach()
+            print("[Server] Updated global generator and prototype bank.", flush=True)
 
         if r % args.save_every == 0:
             ckpt = os.path.join(
@@ -305,6 +517,14 @@ def main():
             torch.save(global_model.state_dict(), ckpt)
             print(f"[Server] Checkpoint saved: {ckpt}")
 
+            if args.enable_gan:
+                gan_ckpt = os.path.join(
+                    args.save_dir,
+                    f"fed_gan_generator_{args.channel}_round{r:03d}.pth",
+                )
+                torch.save(global_generator.state_dict(), gan_ckpt)
+                print(f"[Server] GAN generator checkpoint saved: {gan_ckpt}")
+
     # ==================================================
     # Final Model Save
     # ==================================================
@@ -313,7 +533,15 @@ def main():
         f"fed_deepsc_{args.channel}_final.pth"
     )
     torch.save(global_model.state_dict(), final_ckpt)
-    print(f"\n[Done] Final model saved to: {final_ckpt}", flush=True)
+    print(f"\n[Done] Final DeepSC model saved to: {final_ckpt}", flush=True)
+
+    if args.enable_gan:
+        final_gan_ckpt = os.path.join(
+            args.save_dir,
+            f"fed_gan_generator_{args.channel}_final.pth",
+        )
+        torch.save(global_generator.state_dict(), final_gan_ckpt)
+        print(f"[Done] Final GAN generator saved to: {final_gan_ckpt}", flush=True)
 
 if __name__ == "__main__":
     main()
