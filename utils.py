@@ -303,8 +303,6 @@ def train_step(
 
         # broadcast robust embedding back to all time steps as a residual
         enc_output = enc_output + robust_emb.unsqueeze(1)
-        # Temporary debug: confirm robust_emb is non-zero
-        print(f"[DEBUG] robust_emb norm: {robust_emb.norm().item():.4f}")
 
     channel_enc_output = model.channel_encoder(enc_output)
     Tx_sig = PowerNormalize(channel_enc_output)
