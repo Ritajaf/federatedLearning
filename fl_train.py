@@ -344,9 +344,12 @@ def main():
     if not os.path.exists(vocab_path):
         raise FileNotFoundError(f"Could not find vocab file: {vocab_path}")
 
-    vocab = json.load(open(vocab_path, "rb"))
+    vocab = json.load(open(vocab_path, "r", encoding="utf-8"))
     token_to_idx = vocab["token_to_idx"]
-    idx_to_token = vocab["idx_to_token"]
+    # Build idx_to_token from token_to_idx if not in vocab (preprocess only saves token_to_idx)
+    idx_to_token = vocab.get("idx_to_token")
+    if idx_to_token is None:
+        idx_to_token = {v: k for k, v in token_to_idx.items()}
 
     num_vocab = len(token_to_idx)
     pad_idx = token_to_idx["<PAD>"] #for masking padding tokens 
