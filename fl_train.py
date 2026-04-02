@@ -16,6 +16,7 @@ import random
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from torch.utils.data import DataLoader, Subset
 
@@ -29,10 +30,22 @@ from gan_modules import (
     SemanticDiscriminator,
     local_train_gan,
     federated_aggregate_generator,
+    LearnedPrototypeBank,
+    build_prototype_bank,
+    extract_sentence_embeddings,
 )
 
 # use GPU if available, else CPU
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+# CHANGE 1: Two-stage training schedule constants
+BACKBONE_PRETRAIN_ROUNDS = 30
+GAN_START_ROUND = 25
+PROTO_INIT_ROUND = BACKBONE_PRETRAIN_ROUNDS + 1  # 31
+TOTAL_ROUNDS = 50
+
+# CHANGE 6: Minimum GAN generator update steps per client
+MIN_GAN_STEPS = 30
 
 # Set random seeds for reproducibility
 def set_seed(seed: int):
@@ -138,11 +151,14 @@ def client_update(global_model, client_loader, args, pad_idx, criterion):
 def client_update_with_gan(
     global_model,
     global_generator,
-    global_prototypes,
+    global_prototype_bank,
     client_loader,
     args,
     pad_idx,
     criterion,
+    gan_gen_lr: float,
+    gan_disc_lr: float,
+    min_gan_steps: int,
 ):
     """
     Client update that:
@@ -204,7 +220,7 @@ def client_update_with_gan(
                 criterion=criterion,
                 channel=args.channel,
                 generator=global_generator,
-                global_prototypes=global_prototypes,
+                global_prototypes=global_prototype_bank,
             )
             batch_losses.append(loss)
 
@@ -226,25 +242,28 @@ def client_update_with_gan(
     # use a representative SNR for conditioning (e.g. mid-point of training range)
     gan_snr = float((args.snr_train_low + args.snr_train_high) / 2.0)
 
-    gen_state, client_snr, local_prototypes = local_train_gan(
+    # local_train_gan now returns: gen_state, client_snr, local_proto_tensor, local_gen_recon_loss
+    gen_state, client_snr, local_prototypes, local_gen_recon_loss = local_train_gan(
         client_model=model,
         generator=local_generator,
         discriminator=local_discriminator,
         dataloader=client_loader,
-        global_prototypes=global_prototypes,
+        global_prototype_bank=global_prototype_bank,
         pad_idx=pad_idx,
         snr=gan_snr,
         n_disc_steps=args.gan_disc_steps,
-        gen_lr=args.gan_gen_lr,
-        disc_lr=args.gan_disc_lr,
+        gen_lr=gan_gen_lr,
+        disc_lr=gan_disc_lr,
         lambda_adv=args.gan_lambda_adv,
         lambda_div=args.gan_lambda_div,
         n_prototypes=args.gan_n_prototypes,
+        min_gan_steps=min_gan_steps,
     )
 
     print("  [Client] Local GAN training finished", flush=True)
 
-    return model.state_dict(), mean_loss, gen_state, client_snr, local_prototypes
+    # CHANGE 7: return local generator reconstruction loss for quality-weighted aggregation
+    return model.state_dict(), mean_loss, gen_state, client_snr, local_prototypes, local_gen_recon_loss
 
 
 def main():
@@ -355,6 +374,8 @@ def main():
     args = parser.parse_args()
     if args.gan_n_prototypes < 1:
         parser.error("--gan_n_prototypes must be >= 1")
+    # CHANGE 1: enforce total rounds = 50 as requested
+    args.rounds = TOTAL_ROUNDS
     set_seed(args.seed)
 
     # ==================================================
@@ -448,27 +469,102 @@ def main():
             prototype_dim=args.d_model,
             output_dim=args.d_model,
         ).to(device)
-        global_prototypes = None
+        # CHANGE 1 + 8: learned prototype bank is initialized at round 31
+        global_prototype_bank = None
         print("[Setup] Conditional GAN enabled (generator will be federated, discriminator stays local).", flush=True)
     else:
         global_generator = None
-        global_prototypes = None
+        global_prototype_bank = None
 
     os.makedirs(args.save_dir, exist_ok=True)
 
+    # CHANGE 5: Cosine annealing LR schedule for generator ONLY during stage 2/3 (rounds >= 31)
+    # We create a dummy optimizer + scheduler so we can read its current lr each round.
+    gen_lr_scheduler = None
+    gen_lr_schedule_optimizer = None
+    gen_lr_base = 1e-5
+    gen_lr_min = 1e-7
+    gen_disc_lr_fixed_stage2 = 5e-5
+    if args.enable_gan:
+        gen_lr_schedule_optimizer = torch.optim.Adam(
+            global_generator.parameters(),
+            lr=gen_lr_base,
+            betas=(0.9, 0.98),
+            eps=1e-8,
+        )
+        gen_lr_scheduler = CosineAnnealingLR(
+            gen_lr_schedule_optimizer,
+            T_max=TOTAL_ROUNDS - BACKBONE_PRETRAIN_ROUNDS,
+            eta_min=gen_lr_min,
+        )
+
+    def _init_learned_prototype_bank_from_converged_embeddings():
+        """
+        CHANGE 1: At round 31, initialize the learned prototype bank from
+        sentence embeddings extracted from the converged backbone encoder.
+        """
+        global_model.eval()
+        max_total_samples = min(5000, max(500, args.gan_n_prototypes * 200))
+        max_batches_per_client = 3
+
+        collected = []
+        collected_count = 0
+        with torch.no_grad():
+            for loader in client_loaders:
+                for bi, batch in enumerate(loader):
+                    if collected_count >= max_total_samples:
+                        break
+                    emb = extract_sentence_embeddings(global_model, batch, pad_idx)  # [B, d_model]
+                    collected.append(emb.detach())
+                    collected_count += emb.size(0)
+                    if bi + 1 >= max_batches_per_client:
+                        break
+
+        if not collected:
+            raise RuntimeError("Prototype init failed: no embeddings collected.")
+
+        all_emb = torch.cat(collected, dim=0)
+        if all_emb.size(0) > max_total_samples:
+            all_emb = all_emb[:max_total_samples]
+
+        init_protos = build_prototype_bank(all_emb, n_prototypes=args.gan_n_prototypes)
+        return init_protos
+
     # ==================================================
-    # Federated Training Loop
+    # Federated Training Loop (CHANGE 1 + CHANGE 5)
     # ==================================================
-    for r in range(1, args.rounds + 1):
+    for r in range(1, TOTAL_ROUNDS + 1):
 
         print("\n" + "=" * 70)
-        print(f"[Server] Federated Round {r}/{args.rounds}")
+        print(f"[Server] Federated Round {r}/{TOTAL_ROUNDS}")
         print("=" * 70)
+
+        # CHANGE 1: stage indicators + two-stage training schedule
+        if args.enable_gan:
+            if r <= 24:
+                stage_label = "Stage 1: Backbone-only (NO GAN)"
+            elif r <= BACKBONE_PRETRAIN_ROUNDS:
+                stage_label = "Stage 2: Full GAN training (prototype bank not initialized)"
+            else:
+                stage_label = "Stage 3: Learned prototype bank + cosine LR (generator)"
+            print(f"[Server] {stage_label}", flush=True)
+
+        # Initialize learned prototype bank at round 31
+        if args.enable_gan and r == PROTO_INIT_ROUND:
+            if global_prototype_bank is None:
+                print("[Server][Stage 3] Initializing learned prototype bank from converged embeddings...", flush=True)
+                init_protos = _init_learned_prototype_bank_from_converged_embeddings()
+                global_prototype_bank = LearnedPrototypeBank(
+                    n_prototypes=args.gan_n_prototypes,
+                    d_model=args.d_model,
+                ).to(device)
+                global_prototype_bank.prototypes.data.copy_(init_protos)
+                print("[Server][Stage 3] Prototype bank initialized.", flush=True)
 
         selected = np.random.choice(
             args.num_clients,
             size=min(args.clients_per_round, args.num_clients),
-            replace=False
+            replace=False,
         )
         print(f"[Server] Selected clients: {selected.tolist()}")
 
@@ -476,70 +572,92 @@ def main():
         client_sizes = []
         client_losses = []
 
-        # for GAN-enabled mode, also collect generator states and prototype banks
+        # For GAN-enabled rounds: collect generator + prototype updates and generator-quality loss
         client_gen_states = []
         client_snrs = []
         client_proto_banks = []
+        client_gen_recon_losses = []
+
+        # Decide whether GAN runs this round and what LR to use for generator/discriminator
+        run_gan_this_round = args.enable_gan and r >= GAN_START_ROUND
+        if run_gan_this_round:
+            if r >= PROTO_INIT_ROUND:
+                current_gen_lr = gen_lr_schedule_optimizer.param_groups[0]["lr"]
+                current_disc_lr = gen_disc_lr_fixed_stage2
+            else:
+                current_gen_lr = args.gan_gen_lr
+                current_disc_lr = args.gan_disc_lr
+        else:
+            current_gen_lr = None
+            current_disc_lr = None
 
         for cid in selected:
             print(f"[Server] -> Training client {cid}")
 
-            if args.enable_gan:
-                st, mean_loss, gen_st, client_snr, local_protos = client_update_with_gan(
+            if run_gan_this_round:
+                st, mean_loss, gen_st, client_snr, local_proto_tensor, local_gen_recon_loss = client_update_with_gan(
                     global_model=global_model,
                     global_generator=global_generator,
-                    global_prototypes=global_prototypes,
+                    global_prototype_bank=global_prototype_bank,
                     client_loader=client_loaders[cid],
                     args=args,
                     pad_idx=pad_idx,
                     criterion=criterion,
+                    gan_gen_lr=current_gen_lr,
+                    gan_disc_lr=current_disc_lr,
+                    min_gan_steps=MIN_GAN_STEPS,
                 )
-
                 client_gen_states.append(gen_st)
                 client_snrs.append(client_snr)
-                client_proto_banks.append(local_protos)
+                client_proto_banks.append(local_proto_tensor)
+                client_gen_recon_losses.append(local_gen_recon_loss)
             else:
                 st, mean_loss = client_update(
                     global_model=global_model,
                     client_loader=client_loaders[cid],
                     args=args,
                     pad_idx=pad_idx,
-                    criterion=criterion
+                    criterion=criterion,
                 )
 
             client_states.append(st)
             client_sizes.append(len(client_loaders[cid].dataset))
             client_losses.append(mean_loss)
 
-        alg = getattr(args, 'algorithm', 'fedlol')
-        if alg == 'fedlol':
+        # Aggregate DeepSC backbone (FedAvg/FedLol)
+        alg = getattr(args, "algorithm", "fedlol")
+        if alg == "fedlol":
             print("[Server] Aggregating client DeepSC models (FedLol, loss-weighted)")
             global_model = fedlol(global_model, client_states, client_losses)
         else:
             print("[Server] Aggregating client DeepSC models (FedAvg)")
             global_model = fedavg(global_model, client_states, client_sizes)
 
-        # Aggregate generator only (discriminator is never aggregated)
-        if args.enable_gan and client_gen_states:
-            print("[Server] Aggregating client GAN generators (similarity-weighted)", flush=True)
-            agg_gen_state = federated_aggregate_generator(
+        # Aggregate GAN generator (+ prototype bank if initialized)
+        if run_gan_this_round and client_gen_states:
+            print("[Server] Aggregating client GAN generators (CHANGE 7 quality-weighted)", flush=True)
+            agg_gen_state, agg_proto_tensor = federated_aggregate_generator(
                 client_generator_weights=client_gen_states,
                 client_snrs=client_snrs,
                 client_prototypes=client_proto_banks,
+                client_gen_recon_losses=client_gen_recon_losses,
             )
             global_generator.load_state_dict(agg_gen_state)
 
-            # Update global prototype bank as a simple concatenation of client prototypes
-            all_protos = [p for p in client_proto_banks if p is not None and p.numel() > 0]
-            if all_protos:
-                global_prototypes = torch.cat(all_protos, dim=0).detach()
-            print("[Server] Updated global generator and prototype bank.", flush=True)
+            # If learned prototype bank exists, update global prototypes with same weights (CHANGE 8)
+            if global_prototype_bank is not None and agg_proto_tensor is not None and agg_proto_tensor.numel() > 0:
+                global_prototype_bank.prototypes.data.copy_(agg_proto_tensor.to(device))
+                print("[Server] Updated global learned prototype bank.", flush=True)
+            else:
+                print("[Server] Prototype bank not active yet (round < 31).", flush=True)
+
+        # CHANGE 5: cosine annealing LR update at end of each Stage 3 round
+        if args.enable_gan and r >= PROTO_INIT_ROUND and gen_lr_scheduler is not None:
+            gen_lr_scheduler.step()
+            print(f"[Server] Stage 3 generator lr -> {gen_lr_schedule_optimizer.param_groups[0]['lr']:.3e}", flush=True)
 
         if r % args.save_every == 0:
-            ckpt = os.path.join(
-                args.save_dir,
-                f"fed_deepsc_{args.channel}_round{r:03d}.pth"
-            )
+            ckpt = os.path.join(args.save_dir, f"fed_deepsc_{args.channel}_round{r:03d}.pth")
             torch.save(global_model.state_dict(), ckpt)
             print(f"[Server] Checkpoint saved: {ckpt}")
 

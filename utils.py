@@ -210,6 +210,25 @@ class Channels():
 
         return Rx_sig
 
+
+def _lookup_prototype_vec(sent_emb: torch.Tensor, global_prototypes):
+    """
+    Accept either:
+      - global_prototypes as a tensor [K, d_model] (old KMeans-style)
+      - global_prototypes as a learned prototype bank module (new stage)
+
+    Returns prototype vectors [B, d_model].
+    """
+    if global_prototypes is None:
+        return torch.zeros_like(sent_emb)
+    # Tensor = KMeans-style bank
+    if isinstance(global_prototypes, torch.Tensor):
+        if global_prototypes.numel() == 0:
+            return torch.zeros_like(sent_emb)
+        return get_nearest_prototype(sent_emb, global_prototypes)
+    # Module = LearnedPrototypeBank
+    return global_prototypes(sent_emb)
+
 def initNetParams(model):
     "parameter initialization - all clients start from identically initialized global model"
     for p in model.parameters():
@@ -294,15 +313,15 @@ def train_step(
         snr_linear = 1.0 / (2.0 * (n_var ** 2))
         snr_db = 10.0 * math.log10(snr_linear + 1e-8)
 
-        # sentence-level semantic embedding
+        # sentence-level embedding (for prototype lookup); encoder output remains [B, T, d_model]
         sent_emb = enc_output.mean(dim=1)  # [B, d_model]
         B, _ = sent_emb.shape
         channel_state = torch.full((B, 1), snr_db, device=enc_output.device)
-        proto_vec = get_nearest_prototype(sent_emb, global_prototypes) if global_prototypes is not None else torch.zeros_like(sent_emb)
-        robust_emb = generator(sent_emb, channel_state, proto_vec)  # [B, d_model]
+        proto_vec = _lookup_prototype_vec(sent_emb, global_prototypes)  # [B, d_model]
 
-        # broadcast robust embedding back to all time steps as a residual
-        enc_output = enc_output + robust_emb.unsqueeze(1)
+        # CHANGE 2: token-level generator returns per-token correction [B, T, d_model]
+        correction = generator(enc_output, channel_state, proto_vec)
+        enc_output = enc_output + correction
 
     channel_enc_output = model.channel_encoder(enc_output)
     Tx_sig = PowerNormalize(channel_enc_output)
@@ -398,9 +417,11 @@ def val_step(
         sent_emb = enc_output.mean(dim=1)  # [B, d_model]
         B, _ = sent_emb.shape
         channel_state = torch.full((B, 1), snr_db, device=enc_output.device)
-        proto_vec = get_nearest_prototype(sent_emb, global_prototypes) if global_prototypes is not None else torch.zeros_like(sent_emb)
-        robust_emb = generator(sent_emb, channel_state, proto_vec)
-        enc_output = enc_output + robust_emb.unsqueeze(1)
+        proto_vec = _lookup_prototype_vec(sent_emb, global_prototypes)  # [B, d_model]
+
+        # CHANGE 2: token-level generator correction
+        correction = generator(enc_output, channel_state, proto_vec)
+        enc_output = enc_output + correction
 
     channel_enc_output = model.channel_encoder(enc_output)
     Tx_sig = PowerNormalize(channel_enc_output)
@@ -459,9 +480,11 @@ def greedy_decode(
         sent_emb = enc_output.mean(dim=1)  # [B, d_model]
         B, _ = sent_emb.shape
         channel_state = torch.full((B, 1), snr_db, device=enc_output.device)
-        proto_vec = get_nearest_prototype(sent_emb, global_prototypes) if global_prototypes is not None else torch.zeros_like(sent_emb)
-        robust_emb = generator(sent_emb, channel_state, proto_vec)
-        enc_output = enc_output + robust_emb.unsqueeze(1)
+        proto_vec = _lookup_prototype_vec(sent_emb, global_prototypes)  # [B, d_model]
+
+        # CHANGE 2: token-level generator correction
+        correction = generator(enc_output, channel_state, proto_vec)
+        enc_output = enc_output + correction
 
     channel_enc_output = model.channel_encoder(enc_output)
     Tx_sig = PowerNormalize(channel_enc_output)
