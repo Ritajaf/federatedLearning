@@ -237,6 +237,9 @@ def client_update_with_gan(
         n_disc_steps=args.gan_disc_steps,
         gen_lr=args.gan_gen_lr,
         disc_lr=args.gan_disc_lr,
+        lambda_adv=args.gan_lambda_adv,
+        lambda_div=args.gan_lambda_div,
+        n_prototypes=args.gan_n_prototypes,
     )
 
     print("  [Client] Local GAN training finished", flush=True)
@@ -330,8 +333,28 @@ def main():
         default=1e-4,
         help="Discriminator learning rate for local GAN training.",
     )
+    parser.add_argument(
+        "--gan_lambda_adv",
+        type=float,
+        default=0.1,
+        help="Weight on adversarial (generator vs discriminator) term in local GAN loss.",
+    )
+    parser.add_argument(
+        "--gan_lambda_div",
+        type=float,
+        default=0.01,
+        help="Weight on cosine divergence between nearest global prototype and local prototype vec.",
+    )
+    parser.add_argument(
+        "--gan_n_prototypes",
+        type=int,
+        default=10,
+        help="Number of KMeans cluster centers per client when building the local prototype bank.",
+    )
 
     args = parser.parse_args()
+    if args.gan_n_prototypes < 1:
+        parser.error("--gan_n_prototypes must be >= 1")
     set_seed(args.seed)
 
     # ==================================================

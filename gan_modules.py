@@ -169,6 +169,9 @@ def local_train_gan(
     n_disc_steps: int = 5,
     gen_lr: float = 1e-4,
     disc_lr: float = 1e-4,
+    lambda_adv: float = 0.1,
+    lambda_div: float = 0.01,
+    n_prototypes: int = 10,
 ) -> Tuple[dict, float, torch.Tensor]:
     """
     Two-timescale local training for conditional GAN on top of the DeepSC encoder.
@@ -235,6 +238,8 @@ def local_train_gan(
             disc_output=fake_score,
             global_prototype=global_proto,
             local_prototype=prototype_vec,
+            lambda_adv=lambda_adv,
+            lambda_div=lambda_div,
         )
 
         gen_optimizer.zero_grad()
@@ -243,7 +248,7 @@ def local_train_gan(
 
     if collected_embeddings:
         all_emb = torch.cat(collected_embeddings, dim=0)
-        local_prototypes = build_prototype_bank(all_emb)
+        local_prototypes = build_prototype_bank(all_emb, n_prototypes=n_prototypes)
     else:
         local_prototypes = torch.empty(0, device=device)
 
