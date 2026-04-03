@@ -211,7 +211,7 @@ class Channels():
         return Rx_sig
 
 
-def _lookup_prototype_vec(sent_emb: torch.Tensor, global_prototypes):
+def _lookup_prototype_vec(sent_emb: torch.Tensor, global_prototypes, no_prototype: bool = False):
     """
     Accept either:
       - global_prototypes as a tensor [K, d_model] (old KMeans-style)
@@ -220,6 +220,9 @@ def _lookup_prototype_vec(sent_emb: torch.Tensor, global_prototypes):
     Returns prototype vectors [B, d_model].
     """
     if global_prototypes is None:
+        return torch.zeros_like(sent_emb)
+    if no_prototype:
+        # Temporarily ablate prototype conditioning
         return torch.zeros_like(sent_emb)
     # Tensor = KMeans-style bank
     if isinstance(global_prototypes, torch.Tensor):
@@ -292,6 +295,8 @@ def train_step(
     mi_net=None,
     generator=None,
     global_prototypes=None,
+    no_prototype: bool = False,
+    no_snr: bool = False,
 ):
     model.train()
 
@@ -317,7 +322,10 @@ def train_step(
         sent_emb = enc_output.mean(dim=1)  # [B, d_model]
         B, _ = sent_emb.shape
         channel_state = torch.full((B, 1), snr_db, device=enc_output.device)
-        proto_vec = _lookup_prototype_vec(sent_emb, global_prototypes)  # [B, d_model]
+        if no_snr:
+            # Temporarily ablate SNR conditioning
+            channel_state = torch.zeros_like(channel_state)
+        proto_vec = _lookup_prototype_vec(sent_emb, global_prototypes, no_prototype=no_prototype)  # [B, d_model]
 
         # CHANGE 2: token-level generator returns per-token correction [B, T, d_model]
         correction = generator(enc_output, channel_state, proto_vec)
@@ -401,6 +409,8 @@ def val_step(
     channel,
     generator=None,
     global_prototypes=None,
+    no_prototype: bool = False,
+    no_snr: bool = False,
 ):
     channels = Channels()
     trg_inp = trg[:, :-1]
@@ -417,7 +427,10 @@ def val_step(
         sent_emb = enc_output.mean(dim=1)  # [B, d_model]
         B, _ = sent_emb.shape
         channel_state = torch.full((B, 1), snr_db, device=enc_output.device)
-        proto_vec = _lookup_prototype_vec(sent_emb, global_prototypes)  # [B, d_model]
+        if no_snr:
+            # Temporarily ablate SNR conditioning
+            channel_state = torch.zeros_like(channel_state)
+        proto_vec = _lookup_prototype_vec(sent_emb, global_prototypes, no_prototype=no_prototype)  # [B, d_model]
 
         # CHANGE 2: token-level generator correction
         correction = generator(enc_output, channel_state, proto_vec)
@@ -458,6 +471,8 @@ def greedy_decode(
     rng_seed=None,
     generator=None,
     global_prototypes=None,
+    no_prototype: bool = False,
+    no_snr: bool = False,
 ):
     """
     rng_seed: if set, use a dedicated Generator so the same base randomness is used across SNRs
@@ -480,7 +495,10 @@ def greedy_decode(
         sent_emb = enc_output.mean(dim=1)  # [B, d_model]
         B, _ = sent_emb.shape
         channel_state = torch.full((B, 1), snr_db, device=enc_output.device)
-        proto_vec = _lookup_prototype_vec(sent_emb, global_prototypes)  # [B, d_model]
+        if no_snr:
+            # Temporarily ablate SNR conditioning
+            channel_state = torch.zeros_like(channel_state)
+        proto_vec = _lookup_prototype_vec(sent_emb, global_prototypes, no_prototype=no_prototype)  # [B, d_model]
 
         # CHANGE 2: token-level generator correction
         correction = generator(enc_output, channel_state, proto_vec)

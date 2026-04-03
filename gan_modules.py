@@ -236,7 +236,9 @@ def local_train_gan(
     lambda_div: float = 0.01,
     n_prototypes: int = 10,
     min_gan_steps: int = 30,
-) -> Tuple[dict, float, torch.Tensor, float]:
+    no_prototype: bool = False,
+    no_snr: bool = False,
+) -> Tuple[dict, float, torch.Tensor, float, dict]:
     """
     Two-timescale local training for conditional GAN on top of the DeepSC encoder.
 
@@ -246,6 +248,7 @@ def local_train_gan(
         - client_snr (the scalar SNR used during GAN training)
         - local learned prototype bank parameters (if global_prototype_bank is provided)
         - local generator reconstruction loss (semantic space) for aggregation quality
+        - discriminator state_dict (for optional aggregation)
     """
     device = next(client_model.parameters()).device
     client_model.eval()  # encoder is used as a fixed feature extractor here
@@ -287,14 +290,18 @@ def local_train_gan(
 
         B, d_model = semantic_emb.shape
         channel_state = torch.full((B, 1), channel_state_value, device=device)
+        if no_snr:
+            # Temporarily ablate SNR conditioning
+            channel_state = torch.zeros_like(channel_state)
 
         # Prototype conditioning (learned bank in stage 2, otherwise zeros)
-        if local_prototype_bank is not None:
+        if local_prototype_bank is not None and not no_prototype:
             prototype_vec_local = local_prototype_bank(semantic_emb)  # [B, d_model]
             with torch.no_grad():
                 prototype_vec_global = global_prototype_bank(semantic_emb).detach()  # [B, d_model]
             lambda_div_effective = lambda_div
         else:
+            # Temporarily ablate prototype conditioning
             prototype_vec_local = torch.zeros_like(semantic_emb)
             prototype_vec_global = torch.zeros_like(semantic_emb)
             lambda_div_effective = 0.0  # avoid meaningless cosine loss when no prototype bank exists
@@ -353,7 +360,13 @@ def local_train_gan(
         local_prototypes_out = torch.empty(0, device=device)
 
     local_gen_recon_loss = gen_recon_loss_sum / max(1, gen_steps)
-    return copy.deepcopy(generator.state_dict()), channel_state_value, local_prototypes_out, local_gen_recon_loss
+    return (
+        copy.deepcopy(generator.state_dict()),
+        channel_state_value,
+        local_prototypes_out,
+        local_gen_recon_loss,
+        copy.deepcopy(discriminator.state_dict()),
+    )
 
 
 def federated_aggregate_generator(
@@ -441,4 +454,75 @@ def federated_aggregate_generator(
         agg_prototypes = (weights.view(n_clients, 1, 1) * proto_tensor).sum(dim=0)  # [P, D]
 
     return agg_gen_state, agg_prototypes
+
+
+def federated_aggregate_discriminator(
+    client_discriminator_weights: List[dict],
+    client_snrs: List[float],
+    client_prototypes: List[torch.Tensor],
+    client_gen_recon_losses: List[float],
+) -> dict:
+    """
+    Naive baseline: aggregate discriminator like generator.
+
+    CHANGE (temporary): add server-side discriminator aggregation when enabled
+    via fl_train.py's --naive_gan flag.
+    """
+    n_clients = len(client_discriminator_weights)
+    if n_clients == 0:
+        raise ValueError("client_discriminator_weights is empty.")
+
+    device = next(iter(client_discriminator_weights[0].values())).device
+    mean_snr = float(sum(client_snrs) / len(client_snrs))
+
+    snr_sim = torch.tensor(
+        [1.0 / (1.0 + abs(s - mean_snr)) for s in client_snrs],
+        dtype=torch.float32,
+        device=device,
+    )
+
+    gen_quality = torch.tensor(
+        [1.0 / (1.0 + float(L)) for L in client_gen_recon_losses],
+        dtype=torch.float32,
+        device=device,
+    )
+
+    max_P = max((p.size(0) for p in client_prototypes if p is not None and p.numel() > 0), default=0)
+    if max_P == 0:
+        s_proto = torch.ones(n_clients, dtype=torch.float32, device=device)
+        proto_tensor = None
+    else:
+        proto_dim = client_prototypes[0].size(-1) if client_prototypes[0].numel() > 0 else 1
+        proto_tensor = torch.zeros(n_clients, max_P, proto_dim, device=device)
+        for i, p in enumerate(client_prototypes):
+            if p is None or p.numel() == 0:
+                continue
+            P = min(p.size(0), max_P)
+            proto_tensor[i, :P] = p[:P]
+
+        global_proto_mean = proto_tensor.mean(dim=0)
+        global_flat = F.normalize(global_proto_mean.flatten(), dim=-1)
+
+        s_proto = torch.zeros(n_clients, dtype=torch.float32, device=device)
+        for i in range(n_clients):
+            local_flat = F.normalize(proto_tensor[i].flatten(), dim=-1)
+            proto_sim = F.cosine_similarity(local_flat, global_flat, dim=0).item()
+            s_proto[i] = max(proto_sim, 0.0)
+
+    weights = snr_sim * s_proto * gen_quality
+    if weights.sum() <= 0:
+        weights = torch.ones_like(weights) / len(weights)
+    else:
+        weights = weights / weights.sum()
+
+    agg_disc_state = {}
+    for key in client_discriminator_weights[0].keys():
+        agg_param = None
+        for i in range(n_clients):
+            w = weights[i]
+            param = client_discriminator_weights[i][key]
+            agg_param = w * param if agg_param is None else (agg_param + w * param)
+        agg_disc_state[key] = agg_param
+
+    return agg_disc_state
 

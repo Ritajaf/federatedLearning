@@ -30,6 +30,7 @@ from gan_modules import (
     SemanticDiscriminator,
     local_train_gan,
     federated_aggregate_generator,
+    federated_aggregate_discriminator,
     LearnedPrototypeBank,
     build_prototype_bank,
     extract_sentence_embeddings,
@@ -152,6 +153,7 @@ def client_update_with_gan(
     global_model,
     global_generator,
     global_prototype_bank,
+    global_discriminator,
     client_loader,
     args,
     pad_idx,
@@ -221,6 +223,8 @@ def client_update_with_gan(
                 channel=args.channel,
                 generator=global_generator,
                 global_prototypes=global_prototype_bank,
+                no_prototype=args.no_prototype,
+                no_snr=args.no_snr,
             )
             batch_losses.append(loss)
 
@@ -237,13 +241,17 @@ def client_update_with_gan(
     # GAN training in semantic space
     # ------------------------------
     local_generator = copy.deepcopy(global_generator).to(device)
-    local_discriminator = SemanticDiscriminator(embedding_dim=args.d_model).to(device)
+    # CHANGE (temporary): if naive_gan is enabled, initialize from global aggregated discriminator
+    if global_discriminator is not None:
+        local_discriminator = copy.deepcopy(global_discriminator).to(device)
+    else:
+        local_discriminator = SemanticDiscriminator(embedding_dim=args.d_model).to(device)
 
     # use a representative SNR for conditioning (e.g. mid-point of training range)
     gan_snr = float((args.snr_train_low + args.snr_train_high) / 2.0)
 
     # local_train_gan now returns: gen_state, client_snr, local_proto_tensor, local_gen_recon_loss
-    gen_state, client_snr, local_prototypes, local_gen_recon_loss = local_train_gan(
+    gen_state, client_snr, local_prototypes, local_gen_recon_loss, disc_state = local_train_gan(
         client_model=model,
         generator=local_generator,
         discriminator=local_discriminator,
@@ -258,12 +266,23 @@ def client_update_with_gan(
         lambda_div=args.gan_lambda_div,
         n_prototypes=args.gan_n_prototypes,
         min_gan_steps=min_gan_steps,
+        no_prototype=args.no_prototype,
+        no_snr=args.no_snr,
     )
 
     print("  [Client] Local GAN training finished", flush=True)
 
     # CHANGE 7: return local generator reconstruction loss for quality-weighted aggregation
-    return model.state_dict(), mean_loss, gen_state, client_snr, local_prototypes, local_gen_recon_loss
+    # CHANGE (temporary): also return discriminator state_dict for optional naive discriminator aggregation
+    return (
+        model.state_dict(),
+        mean_loss,
+        gen_state,
+        client_snr,
+        local_prototypes,
+        local_gen_recon_loss,
+        disc_state,
+    )
 
 
 def main():
@@ -333,6 +352,23 @@ def main():
         action="store_true",
         help="If set, train a conditional GAN on top of the encoder and "
         "federate only the generator using similarity-weighted aggregation.",
+    )
+    # CHANGE (temporary): discriminator aggregation baseline
+    parser.add_argument(
+        "--naive_gan",
+        action="store_true",
+        help="Aggregate discriminator like generator (naive baseline).",
+    )
+    # CHANGE (temporary): ablate conditioning signals
+    parser.add_argument(
+        "--no_prototype",
+        action="store_true",
+        help="Remove prototype conditioning from generator.",
+    )
+    parser.add_argument(
+        "--no_snr",
+        action="store_true",
+        help="Remove SNR conditioning from generator.",
     )
     parser.add_argument(
         "--gan_disc_steps",
@@ -471,10 +507,15 @@ def main():
         ).to(device)
         # CHANGE 1 + 8: learned prototype bank is initialized at round 31
         global_prototype_bank = None
+        global_discriminator = None
+        if args.naive_gan:
+            global_discriminator = SemanticDiscriminator(embedding_dim=args.d_model).to(device)
+            print("[Setup] Naive GAN enabled: discriminator will be aggregated.", flush=True)
         print("[Setup] Conditional GAN enabled (generator will be federated, discriminator stays local).", flush=True)
     else:
         global_generator = None
         global_prototype_bank = None
+        global_discriminator = None
 
     os.makedirs(args.save_dir, exist_ok=True)
 
@@ -577,6 +618,7 @@ def main():
         client_snrs = []
         client_proto_banks = []
         client_gen_recon_losses = []
+        client_disc_states = []
 
         # Decide whether GAN runs this round and what LR to use for generator/discriminator
         run_gan_this_round = args.enable_gan and r >= GAN_START_ROUND
@@ -595,10 +637,11 @@ def main():
             print(f"[Server] -> Training client {cid}")
 
             if run_gan_this_round:
-                st, mean_loss, gen_st, client_snr, local_proto_tensor, local_gen_recon_loss = client_update_with_gan(
+                st, mean_loss, gen_st, client_snr, local_proto_tensor, local_gen_recon_loss, disc_state = client_update_with_gan(
                     global_model=global_model,
                     global_generator=global_generator,
                     global_prototype_bank=global_prototype_bank,
+                    global_discriminator=global_discriminator,
                     client_loader=client_loaders[cid],
                     args=args,
                     pad_idx=pad_idx,
@@ -611,6 +654,7 @@ def main():
                 client_snrs.append(client_snr)
                 client_proto_banks.append(local_proto_tensor)
                 client_gen_recon_losses.append(local_gen_recon_loss)
+                client_disc_states.append(disc_state)
             else:
                 st, mean_loss = client_update(
                     global_model=global_model,
@@ -650,6 +694,17 @@ def main():
                 print("[Server] Updated global learned prototype bank.", flush=True)
             else:
                 print("[Server] Prototype bank not active yet (round < 31).", flush=True)
+
+        # CHANGE (temporary): optionally aggregate discriminators like generator
+        if run_gan_this_round and args.naive_gan and client_disc_states:
+            print("[Server] Aggregating client GAN discriminators (naive baseline)", flush=True)
+            agg_disc_state = federated_aggregate_discriminator(
+                client_discriminator_weights=client_disc_states,
+                client_snrs=client_snrs,
+                client_prototypes=client_proto_banks,
+                client_gen_recon_losses=client_gen_recon_losses,
+            )
+            global_discriminator.load_state_dict(agg_disc_state)
 
         # CHANGE 5: cosine annealing LR update at end of each Stage 3 round
         if args.enable_gan and r >= PROTO_INIT_ROUND and gen_lr_scheduler is not None:
